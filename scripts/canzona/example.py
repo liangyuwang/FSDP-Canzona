@@ -33,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from matrix_based_optimizer import Muon, SOAP  # noqa: E402
+from matrix_based_optimizer import Muon, SOAP, is_param_use_matrix_based_optim  # noqa: E402
 
 
 class TinyCausalLM(nn.Module):
@@ -151,9 +151,7 @@ def build_model(args, device):
 def selected_matrix_params(model):
     selected = []
     for name, param in model.named_parameters():
-        if param.ndim != 2:
-            continue
-        if "token_embed" in name or "lm_head" in name:
+        if not is_param_use_matrix_based_optim(name, param):
             continue
         selected.append((name, param))
     if not selected:

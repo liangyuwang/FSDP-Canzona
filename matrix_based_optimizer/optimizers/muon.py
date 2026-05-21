@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 import math
 import os
 
@@ -48,6 +49,16 @@ _COEFFICIENT_SETS = {
         (1.8750, -1.2500, 0.3750),
     ],
 }
+
+
+def _get_fsdp_world_size(group):
+    if not dist.is_available() or not dist.is_initialized():
+        return 1
+    process_group = group.get("fsdp_group", group.get("process_group"))
+    try:
+        return dist.get_world_size(process_group)
+    except TypeError:
+        return process_group.size()
 
 # @torch.compile
 def zeropower_via_newtonschulz5(G, steps=5, ns_coefficient_type="simple", ns_norm_eps=1e-7):
@@ -169,6 +180,14 @@ class Muon(BaseOptim):
         scale_factor = 0.2 * math.sqrt(max(A, B))
         return scale_factor
 
+    def _get_scale_fsdp_world_size(self, p, grad, group):
+        if not group.get("is_fsdp_sharded", group.get("fsdp_sharded", False)):
+            return 1
+        full_shape = group.get("shapes_map", {}).get(p, {}).get("origin_shape")
+        if full_shape is not None and tuple(full_shape) == tuple(grad.shape):
+            return 1
+        return _get_fsdp_world_size(group)
+
     def _single_param_update(self, p, u, group):
         weight_decay = group["weight_decay"]
         lr = group["lr"]
@@ -192,7 +211,7 @@ class Muon(BaseOptim):
             grad = buf
 
         u = zeropower_via_newtonschulz5(grad, steps=ns_steps,ns_coefficient_type=ns_coefficient_type, ns_norm_eps=ns_norm_eps)
-        fsdp_world_size = group.get("fsdp_world_size", 1)
+        fsdp_world_size = self._get_scale_fsdp_world_size(p, grad, group)
         scale_factor = self.get_muon_scale_factor(grad.shape, fsdp_world_size=fsdp_world_size)
         u = u * scale_factor
         return u

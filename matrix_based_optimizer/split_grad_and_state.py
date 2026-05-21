@@ -9,19 +9,50 @@ class GradAndStateSplitter:
         'is_mlp_fc1',
         'is_linear_attn_inproj'
     ]
+    SPLIT_ATTR_ALIASES = {
+        'is_attention_qkv': 'is_full_attn_qkv',
+        'is_moe_shared_expert_up_proj': 'is_shared_expert_fc1',
+        'is_moe_expert_up_proj': 'is_expert_fc1',
+        'is_mlp_up_proj': 'is_mlp_fc1',
+        'is_linear_attention_in_proj': 'is_linear_attn_inproj',
+    }
+    SPLIT_SHAPE_KEY_ALIASES = {
+        'is_attention_qkv': 'is_full_attn_qkv',
+        'is_attention_qkv_num_heads': 'is_full_attn_qkv_num_heads',
+        'is_moe_shared_expert_up_proj': 'is_shared_expert_fc1',
+        'is_moe_expert_up_proj': 'is_expert_fc1',
+        'is_mlp_up_proj': 'is_mlp_fc1',
+        'is_linear_attention_in_proj': 'is_linear_attn_inproj',
+        'is_linear_attention_in_proj_num_heads': 'is_linear_attn_inproj_num_heads',
+    }
 
     def __init__(self, matrix_based_optimizer_split_params, matrix_based_optimizer_split_shape_map):
         self.matrix_based_optimizer_split_params = matrix_based_optimizer_split_params
-        self.matrix_based_optimizer_split_shape_map = matrix_based_optimizer_split_shape_map
+        self.matrix_based_optimizer_split_shape_map = self.normalize_split_shape_map(matrix_based_optimizer_split_shape_map)
         self.split_attrs = self.get_attrs()
 
+    @classmethod
+    def normalize_split_shape_map(cls, split_shape_map):
+        if split_shape_map is None:
+            return {}
+        normalized = dict(split_shape_map)
+        for alias, canonical in cls.SPLIT_SHAPE_KEY_ALIASES.items():
+            if alias in normalized and canonical not in normalized:
+                normalized[canonical] = normalized[alias]
+        return normalized
+
     def get_attrs(self):
-        split_attrs = ['is_full_attn_qkv', 'is_shared_expert_fc1', 'is_expert_fc1', 'is_mlp_fc1', 'is_linear_attn_inproj']
-        return split_attrs
+        return self.SPLIT_ATTRS + list(self.SPLIT_ATTR_ALIASES.keys())
 
     @classmethod
     def get_split_param_methods(cls, param):
-        return [attr for attr in cls.SPLIT_ATTRS if getattr(param, attr, False)]
+        methods = [attr for attr in cls.SPLIT_ATTRS if getattr(param, attr, False)]
+        methods.extend(
+            canonical
+            for alias, canonical in cls.SPLIT_ATTR_ALIASES.items()
+            if getattr(param, alias, False)
+        )
+        return list(dict.fromkeys(methods))
 
     def compute_split_grad_shapes(self, param, split_method: str):
         split_shape_map = self.matrix_based_optimizer_split_shape_map

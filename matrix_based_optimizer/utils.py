@@ -5,6 +5,22 @@ from typing import Union
 from contextlib import contextmanager
 
 
+MATRIX_OPTIM_EXCLUDE_NAME_TOKENS = (
+    # Generic PyTorch / HuggingFace-style embeddings and heads.
+    "embed",
+    "embedding",
+    "lm_head",
+    "classifier",
+    # Common Megatron-compatible aliases kept for migrated checkpoints/models.
+    "word_embeddings",
+    "position_embeddings",
+    "output_layer",
+    # Router logits are usually small auxiliary projections, not matrix-optimizer targets.
+    "router",
+    "gate_weight",
+)
+
+
 def is_matrix_based_optim(optim_name=None):
     return optim_name in {"muon", "soap"} if optim_name is not None else False
 
@@ -12,17 +28,17 @@ def is_matrix_based_optim_group(param_group):
     return bool(param_group.get('use_muon', False) or param_group.get('use_soap', False))
 
 def is_param_use_matrix_based_optim(name: str, param: torch.Tensor) -> bool:
-    # assert param.ndim <= 2, 'Tensors with ndim > 2 are not supported.'
-    # Matrix based optimizer for exactly 2-D weights, excluding embeddings and output head.
-    use_matrix_based_opt = (
-        # param.ndim in [1, 2] if args.soap_precondition_1d else param.ndim == 2
-        param.ndim == 2
-        and 'word_embeddings' not in name
-        and 'output_layer' not in name
-        and 'router' not in name
-        and 'gate_weight' not in name
-    )
-    return use_matrix_based_opt
+    """Return whether a named parameter should use a matrix-based optimizer.
+
+    This helper is intentionally framework-agnostic. It selects 2D weights and
+    excludes embeddings, language-model heads, classifiers, and router logits
+    across common PyTorch/HuggingFace names while retaining Megatron-compatible
+    aliases for users migrating models.
+    """
+    if param.ndim != 2:
+        return False
+    name_lower = name.lower()
+    return not any(token in name_lower for token in MATRIX_OPTIM_EXCLUDE_NAME_TOKENS)
 
 def get_optim_memory_from_param(p: torch.Tensor) -> Union[int, float]:
     return p.numel()    # muon optimizer state shape is the same as p shape
