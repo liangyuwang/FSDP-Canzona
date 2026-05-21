@@ -13,7 +13,6 @@ class BaseOptim(torch.optim.Optimizer):
         defaults,
         split_params = False,
         split_shape_map = None,
-        async_tp = False,
         fsdp_sharded = False,
         fsdp_group = None,
         fsdp_balance = "global",

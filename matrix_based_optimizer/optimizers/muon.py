@@ -121,7 +121,6 @@ class Muon(BaseOptim):
         adamw_eps=1e-8,
         split_muon_params=False,
         split_muon_shape_map=None,
-        async_tp=False,
         fsdp_sharded=False,
         fsdp_group=None,
         fsdp_balance="global",
@@ -147,7 +146,6 @@ class Muon(BaseOptim):
             defaults,
             split_muon_params,
             split_muon_shape_map,
-            async_tp,
             fsdp_sharded=fsdp_sharded,
             fsdp_group=fsdp_group,
             fsdp_balance=fsdp_balance,
@@ -165,13 +163,9 @@ class Muon(BaseOptim):
         adjusted_lr = lr * adjusted_ratio
         return adjusted_lr
 
-    def get_muon_scale_factor(self, param_shape, tp_size=1, tp_dim=0):
+    def get_muon_scale_factor(self, param_shape, fsdp_world_size=1):
         A, B = param_shape[:2]
-        row_split = tp_dim == 0
-        if row_split:
-            A = A * tp_size
-        else:
-            B = B * tp_size
+        A = A * fsdp_world_size
         scale_factor = 0.2 * math.sqrt(max(A, B))
         return scale_factor
 
@@ -198,6 +192,7 @@ class Muon(BaseOptim):
             grad = buf
 
         u = zeropower_via_newtonschulz5(grad, steps=ns_steps,ns_coefficient_type=ns_coefficient_type, ns_norm_eps=ns_norm_eps)
-        scale_factor = self.get_muon_scale_factor(grad.shape)
+        fsdp_world_size = group.get("fsdp_world_size", 1)
+        scale_factor = self.get_muon_scale_factor(grad.shape, fsdp_world_size=fsdp_world_size)
         u = u * scale_factor
         return u
