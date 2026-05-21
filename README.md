@@ -1,37 +1,59 @@
 # FSDP-Canzona
 
-This repository ports the Canzona matrix-based optimizer idea from
-Megatron-Canzona to an FSDP-style sharding model.
+FSDP-Canzona is an FSDP-oriented implementation of
+[Canzona](https://arxiv.org/html/2602.06079), adapted from the Megatron-based
+[Megatron-Canzona](https://github.com/liangyuwang/Megatron-Canzona) prototype.
 
-The important assumption is the one shown in `image/overview.png`: every matrix
-parameter is uniformly sharded per parameter across the FSDP process group. A
-rank may own only a shard of a 2D parameter, but Muon/SOAP still run on a full
-2D matrix. FSDP-Canzona therefore assigns each full-matrix optimizer task to a
-host rank, gathers the corresponding gradient shards to that rank, computes the
-full update, scatters update shards back to the owning ranks, and applies the
-local shard update.
+Canzona makes matrix-based optimizers such as Muon and SOAP practical under
+distributed sharding. These optimizers need full 2D matrices for operations like
+Newton-Schulz orthogonalization or Shampoo-style preconditioning, while FSDP
+keeps only per-rank parameter shards. FSDP-Canzona bridges that mismatch by
+assigning each full-matrix optimizer task to a host rank, gathering the needed
+gradient shards, computing the full update, scattering update shards back, and
+then applying the local shard update.
 
-## Current Components
+![FSDP-Canzona optimizer-step overview](image/overview.png)
 
-- `matrix_based_optimizer/optimizers/muon.py`: Muon compute kernel.
-- `matrix_based_optimizer/optimizers/soap.py`: SOAP compute kernel.
-- `matrix_based_optimizer/split_grad_and_state.py`: QKV/FC1/in-proj splitting
-  before matrix optimization, then reassembly after compute.
-- `matrix_based_optimizer/load_balanced_fsdp_executor.py`: FSDP Canzona
-  gather/compute/scatter/update executor with micro-group load balancing.
-- `matrix_based_optimizer/utils.py`: optimizer tagging and cost estimation.
+The design mirrors the Megatron-Canzona TP path: both TP and FSDP split each
+parameter uniformly across ranks, so the same gather → compute → scatter →
+update schedule can be reused with FSDP process groups and shard metadata.
 
-## FSDP Param-Group Contract
+## Key Ideas
 
-FSDP-Canzona intentionally avoids depending on PyTorch FSDP private internals.
-The training stack should pass shard metadata through parameter attributes or
+- **Full-matrix optimizer compute:** Muon/SOAP run on reconstructed full 2D
+  gradients, not on partial shards.
+- **Logical host assignment:** each matrix update is assigned to one rank for
+  compute, independent of where the parameter shard physically lives.
+- **Micro-group scheduling:** parameters are grouped so gather, compute,
+  scatter, and local update can be pipelined and load-balanced.
+- **Fused communication path:** shard movement can use fused `all_to_all_single`
+  when enabled.
+- **Optional parameter splitting:** QKV, FC1, and linear-attention input
+  projections can be split into smaller 2D matrices before optimization.
+
+## Package Layout
+
+```text
+matrix_based_optimizer/
+├── load_balanced_fsdp_executor.py  # FSDP gather/compute/scatter/update executor
+├── split_grad_and_state.py         # QKV/FC1/in-proj split and reassembly helpers
+├── utils.py                        # parameter tagging and cost estimates
+└── optimizers/
+    ├── base_optim.py               # common optimizer orchestration
+    ├── muon.py                     # Muon kernel
+    └── soap.py                     # SOAP kernel
+```
+
+## FSDP Contract
+
+FSDP-Canzona intentionally avoids relying on PyTorch FSDP private internals. The
+training stack provides shard metadata either through parameter attributes or
 param-group fields.
-
-Required for sharded matrix params:
 
 ```python
 param_group = {
     "params": local_matrix_shards,
+    "use_muon": True,
     "is_fsdp_sharded": True,
     "fsdp_group": process_group,          # optional; defaults to WORLD
     "fsdp_full_shapes": full_shapes,      # list[torch.Size], one per param
@@ -40,7 +62,7 @@ param_group = {
 }
 ```
 
-Equivalent parameter attributes are also accepted:
+Equivalent per-parameter attributes are also accepted:
 
 ```python
 p.fsdp_full_shape = torch.Size([hidden_out, hidden_in])
@@ -48,9 +70,13 @@ p.fsdp_local_shape = p.shape
 p.fsdp_shard_dim = 0
 ```
 
-The initial implementation supports uniform per-parameter sharding only:
-`full_shape[shard_dim] == local_shape[shard_dim] * fsdp_world_size`, and all
-other dimensions must match.
+The current implementation assumes uniform per-parameter sharding:
+
+```text
+full_shape[shard_dim] == local_shape[shard_dim] * fsdp_world_size
+```
+
+All non-sharded dimensions must match exactly.
 
 ## Usage Sketch
 
@@ -69,18 +95,19 @@ optimizer = Muon(
             "fsdp_shard_dims": shard_dims,
             "fsdp_balance": "global",     # "no", "single", "slot", "global"
             "fsdp_fused_comm": True,      # use all_to_all_single
+            "fsdp_balance_cost": "flops", # or "numel"
         }
     ],
     lr=1e-3,
 )
 ```
 
-For non-sharded local parameters, use the optimizers like regular
+For non-sharded local parameters, the optimizers behave like regular
 `torch.optim.Optimizer` subclasses.
 
-## Notes
+## Current Status
 
-- This is now an FSDP-Canzona path, not a Megatron TP path.
-- Checkpoint remapping for optimizer states across different FSDP world sizes is
-  not implemented yet.
+- FSDP-oriented executor and Muon/SOAP integration are implemented.
+- Megatron TP-specific dependencies have been removed from the main path.
+- Cross-world-size optimizer-state checkpoint remapping is not implemented yet.
 - CUDA graph capture is disabled for the FSDP communication path.
