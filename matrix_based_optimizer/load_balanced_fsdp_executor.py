@@ -20,6 +20,28 @@ class FSDPShardSpec:
     shard_dim: int = 0
 
 
+@dataclass
+class MicroGroupContext:
+    idx: int
+    micro_param_group: object
+    gather_work: object = None
+    gather_send_buffer: object = None
+    gather_recv_buffer: object = None
+    gather_recv_split_sizes: object = None
+    gather_local_numels: object = None
+    full_tensors_group: object = None
+    full_updates_group: object = None
+    scatter_work: object = None
+    scatter_flag_work: object = None
+    scatter_send_buffer: object = None
+    scatter_recv_buffer: object = None
+    scatter_recv_split_sizes: object = None
+    scatter_flag_send_buffer: object = None
+    scatter_flag_recv_buffer: object = None
+    scatter_flag_recv_split_sizes: object = None
+    shard_updates_group: object = None
+
+
 def get_numel_from_shape(shape: Sequence[int]) -> int:
     return functools.reduce(operator.mul, shape, 1)
 
@@ -156,6 +178,7 @@ class FSDPShardExecutor:
         optimizer: str = "muon",
         soap_precondition_frequency: int = 10,
         soap_max_precond_dim: int = 10000,
+        overlap: str = "none",
     ):
         self.group = group
         self.group_rank = _get_group_rank(group) if dist.is_available() and dist.is_initialized() else 0
@@ -168,6 +191,7 @@ class FSDPShardExecutor:
         self.optimizer = optimizer
         self.soap_precondition_frequency = soap_precondition_frequency
         self.soap_max_precond_dim = soap_max_precond_dim
+        self.overlap = overlap
 
     @classmethod
     def from_param_group(cls, group: dict) -> "FSDPShardExecutor":
@@ -184,6 +208,7 @@ class FSDPShardExecutor:
             optimizer=optimizer_name,
             soap_precondition_frequency=group.get("precondition_frequency", 10),
             soap_max_precond_dim=group.get("max_precond_dim", 10000),
+            overlap=group.get("fsdp_overlap", "none"),
         )
 
     def execute(self, param_group, param_step_fn: Callable, param_update_fn: Callable, *args, **kwargs):
@@ -196,6 +221,17 @@ class FSDPShardExecutor:
             param_group["params"],
             specs,
         )
+        if self.overlap == "full":
+            return self.execute_full_overlap(
+                micro_param_groups,
+                param_group,
+                param_step_fn,
+                param_update_fn,
+                *args,
+                **kwargs,
+            )
+        if self.overlap != "none":
+            raise ValueError(f"Unknown FSDP-Canzona overlap mode: {self.overlap}")
         for micro_param_group in micro_param_groups:
             full_tensors_group = self.gather(micro_param_group)
             full_updates_group = self.compute(
@@ -208,6 +244,196 @@ class FSDPShardExecutor:
             )
             shard_updates_group = self.scatter(micro_param_group, full_updates_group)
             self.update(micro_param_group, shard_updates_group, param_update_fn, *args, group=param_group, **kwargs)
+
+    def execute_full_overlap(self, micro_param_groups, param_group, param_step_fn, param_update_fn, *args, **kwargs):
+        if not self.fused_comm:
+            raise NotImplementedError("fsdp_overlap='full' currently requires fsdp_fused_comm=True.")
+        if not micro_param_groups:
+            return
+
+        contexts = [
+            MicroGroupContext(idx=idx, micro_param_group=micro_param_group)
+            for idx, micro_param_group in enumerate(micro_param_groups)
+        ]
+
+        self.launch_gather(contexts[0])
+        for idx, ctx in enumerate(contexts):
+            self.finish_gather(ctx)
+            if idx + 1 < len(contexts):
+                self.launch_gather(contexts[idx + 1])
+
+            ctx.full_updates_group = self.compute(
+                ctx.micro_param_group,
+                ctx.full_tensors_group,
+                param_step_fn,
+                *args,
+                group=param_group,
+                **kwargs,
+            )
+            self.launch_scatter(ctx)
+
+            if idx - 1 >= 0:
+                prev = contexts[idx - 1]
+                self.finish_scatter(prev)
+                self.update(prev.micro_param_group, prev.shard_updates_group, param_update_fn, *args, group=param_group, **kwargs)
+
+        last = contexts[-1]
+        self.finish_scatter(last)
+        self.update(last.micro_param_group, last.shard_updates_group, param_update_fn, *args, group=param_group, **kwargs)
+
+    def launch_gather(self, ctx: MicroGroupContext):
+        micro_param_group = ctx.micro_param_group
+        ctx.full_tensors_group = [[] for _ in range(self.world_size)]
+        ref = self._first_grad_or_param(micro_param_group)
+        if ref is None:
+            return
+
+        send_tensors = []
+        send_split_sizes = []
+        for _, slot in micro_param_group:
+            grads_for_host = [
+                p.grad.contiguous().view(spec.local_shape).reshape(-1)
+                for p, spec in slot
+                if p.grad is not None
+            ]
+            if grads_for_host:
+                tensor = torch.cat(grads_for_host).contiguous()
+            else:
+                tensor = torch.empty(0, dtype=ref.dtype, device=ref.device)
+            send_tensors.append(tensor)
+            send_split_sizes.append(tensor.numel())
+
+        ctx.gather_send_buffer = torch.cat(send_tensors).contiguous() if send_tensors else torch.empty(0, dtype=ref.dtype, device=ref.device)
+        _, my_slot = micro_param_group[self.group_rank]
+        ctx.gather_local_numels = [get_numel_from_shape(spec.local_shape) for _, spec in my_slot]
+        recv_per_rank = sum(ctx.gather_local_numels)
+        ctx.gather_recv_split_sizes = [recv_per_rank] * self.world_size
+        ctx.gather_recv_buffer = torch.empty(
+            sum(ctx.gather_recv_split_sizes),
+            dtype=ctx.gather_send_buffer.dtype,
+            device=ctx.gather_send_buffer.device,
+        )
+        ctx.gather_work = dist.all_to_all_single(
+            ctx.gather_recv_buffer,
+            ctx.gather_send_buffer,
+            output_split_sizes=ctx.gather_recv_split_sizes,
+            input_split_sizes=send_split_sizes,
+            group=self.group,
+            async_op=True,
+        )
+
+    def finish_gather(self, ctx: MicroGroupContext):
+        if ctx.gather_work is None:
+            return ctx.full_tensors_group
+        ctx.gather_work.wait()
+        my_slot = ctx.micro_param_group[self.group_rank][1]
+        recv_streams = torch.split(ctx.gather_recv_buffer, ctx.gather_recv_split_sizes)
+        stream_offset = 0
+        for (p, spec), shard_numel in zip(my_slot, ctx.gather_local_numels):
+            shards = []
+            for src_rank in range(self.world_size):
+                shard = recv_streams[src_rank][stream_offset : stream_offset + shard_numel]
+                shards.append(shard.contiguous().view(spec.local_shape))
+            ctx.full_tensors_group[self.group_rank].append(torch.cat(shards, dim=spec.shard_dim).view(spec.full_shape))
+            stream_offset += shard_numel
+        return ctx.full_tensors_group
+
+    def launch_scatter(self, ctx: MicroGroupContext):
+        micro_param_group = ctx.micro_param_group
+        full_updates_group = ctx.full_updates_group
+        ctx.shard_updates_group = [[] for _ in range(self.world_size)]
+        ref = self._first_grad_or_param(micro_param_group)
+        if ref is None:
+            return
+
+        send_streams = [[] for _ in range(self.world_size)]
+        send_flag_streams = [[] for _ in range(self.world_size)]
+        for host_group_rank, slot in micro_param_group:
+            if host_group_rank != self.group_rank:
+                continue
+            for (p, spec), full_update in zip(slot, full_updates_group[host_group_rank]):
+                skip_update = full_update is None
+                if full_update is None:
+                    full_update = torch.zeros(spec.full_shape, dtype=ref.dtype, device=ref.device)
+                shards = torch.chunk(full_update.contiguous().view(spec.full_shape), self.world_size, dim=spec.shard_dim)
+                for target_rank, shard in enumerate(shards):
+                    send_streams[target_rank].append(shard.contiguous().view(-1))
+                    send_flag_streams[target_rank].append(
+                        torch.tensor([1 if skip_update else 0], dtype=torch.uint8, device=ref.device)
+                    )
+
+        flat_send_tensors = []
+        send_split_sizes = []
+        for stream in send_streams:
+            if stream:
+                tensor = torch.cat(stream).contiguous()
+            else:
+                tensor = torch.empty(0, dtype=ref.dtype, device=ref.device)
+            flat_send_tensors.append(tensor)
+            send_split_sizes.append(tensor.numel())
+
+        ctx.scatter_send_buffer = torch.cat(flat_send_tensors).contiguous() if flat_send_tensors else torch.empty(0, dtype=ref.dtype, device=ref.device)
+        ctx.scatter_recv_split_sizes = [
+            sum(get_numel_from_shape(spec.local_shape) for _, spec in slot)
+            for _, slot in micro_param_group
+        ]
+        ctx.scatter_recv_buffer = torch.empty(
+            sum(ctx.scatter_recv_split_sizes),
+            dtype=ctx.scatter_send_buffer.dtype,
+            device=ctx.scatter_send_buffer.device,
+        )
+        ctx.scatter_work = dist.all_to_all_single(
+            ctx.scatter_recv_buffer,
+            ctx.scatter_send_buffer,
+            output_split_sizes=ctx.scatter_recv_split_sizes,
+            input_split_sizes=send_split_sizes,
+            group=self.group,
+            async_op=True,
+        )
+
+        flat_send_flags = []
+        flag_send_split_sizes = []
+        for stream in send_flag_streams:
+            if stream:
+                tensor = torch.cat(stream).contiguous()
+            else:
+                tensor = torch.empty(0, dtype=torch.uint8, device=ref.device)
+            flat_send_flags.append(tensor)
+            flag_send_split_sizes.append(tensor.numel())
+        ctx.scatter_flag_send_buffer = torch.cat(flat_send_flags).contiguous() if flat_send_flags else torch.empty(0, dtype=torch.uint8, device=ref.device)
+        ctx.scatter_flag_recv_split_sizes = [len(slot) for _, slot in micro_param_group]
+        ctx.scatter_flag_recv_buffer = torch.empty(sum(ctx.scatter_flag_recv_split_sizes), dtype=torch.uint8, device=ref.device)
+        ctx.scatter_flag_work = dist.all_to_all_single(
+            ctx.scatter_flag_recv_buffer,
+            ctx.scatter_flag_send_buffer,
+            output_split_sizes=ctx.scatter_flag_recv_split_sizes,
+            input_split_sizes=flag_send_split_sizes,
+            group=self.group,
+            async_op=True,
+        )
+
+    def finish_scatter(self, ctx: MicroGroupContext):
+        if ctx.scatter_work is None:
+            return ctx.shard_updates_group
+        ctx.scatter_work.wait()
+        ctx.scatter_flag_work.wait()
+        recv_streams = torch.split(ctx.scatter_recv_buffer, ctx.scatter_recv_split_sizes)
+        flag_recv_streams = torch.split(ctx.scatter_flag_recv_buffer, ctx.scatter_flag_recv_split_sizes)
+        for src_group_rank, (_, slot) in enumerate(ctx.micro_param_group):
+            src_stream = recv_streams[src_group_rank]
+            flag_stream = flag_recv_streams[src_group_rank]
+            offset = 0
+            for flag_idx, (_, spec) in enumerate(slot):
+                shard_numel = get_numel_from_shape(spec.local_shape)
+                skip_update = bool(flag_stream[flag_idx].item())
+                if skip_update:
+                    ctx.shard_updates_group[src_group_rank].append(None)
+                else:
+                    ctx.shard_updates_group[src_group_rank].append(
+                        src_stream[offset : offset + shard_numel].contiguous().view(spec.local_shape)
+                    )
+                offset += shard_numel
+        return ctx.shard_updates_group
 
     def gather(self, micro_param_group):
         if self.fused_comm:

@@ -128,6 +128,7 @@ class Muon(BaseOptim):
         fsdp_fused_comm=True,
         fsdp_max_numel_per_slot=None,
         fsdp_balance_cost="numel",
+        fsdp_overlap="none",
     ):
         defaults = dict(
             lr=lr,
@@ -153,6 +154,7 @@ class Muon(BaseOptim):
             fsdp_fused_comm=fsdp_fused_comm,
             fsdp_max_numel_per_slot=fsdp_max_numel_per_slot,
             fsdp_balance_cost=fsdp_balance_cost,
+            fsdp_overlap=fsdp_overlap,
         )
 
     def adjust_lr_for_muon(self, lr, param_shape):

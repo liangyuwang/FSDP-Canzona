@@ -20,6 +20,7 @@ class BaseOptim(torch.optim.Optimizer):
         fsdp_fused_comm = True,
         fsdp_max_numel_per_slot = None,
         fsdp_balance_cost = "numel",
+        fsdp_overlap = "none",
     ):
         # Let base class normalize groups and fill defaults
         super().__init__(params, defaults)
@@ -31,6 +32,7 @@ class BaseOptim(torch.optim.Optimizer):
             "fsdp_fused_comm": fsdp_fused_comm,
             "fsdp_max_numel_per_slot": fsdp_max_numel_per_slot,
             "fsdp_balance_cost": fsdp_balance_cost,
+            "fsdp_overlap": fsdp_overlap,
         }
         # add cuda graph
         self.use_cuda_graph = int(os.environ.get('USE_CUDA_GRAPH_OPTIM', 0)) == 1

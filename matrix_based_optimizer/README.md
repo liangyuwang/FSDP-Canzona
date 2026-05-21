@@ -38,6 +38,9 @@ Set these fields for sharded matrix params:
 - `fsdp_max_numel_per_slot`: optional slot capacity for `slot`/`global`
   scheduling.
 - `fsdp_balance_cost`: `numel` or `flops`.
+- `fsdp_overlap`: `none` for the serial path, or `full` for the pipelined path
+  that overlaps gather for the next micro-group, compute for the current
+  micro-group, and scatter/update for the previous micro-group.
 
 Parameter attributes with the same meaning are also supported:
 `fsdp_full_shape`, `fsdp_local_shape`, and `fsdp_shard_dim`.
@@ -47,4 +50,5 @@ Parameter attributes with the same meaning are also supported:
 - Uniform per-parameter sharding is required.
 - Optimizer states are kept on the host rank for the full matrix tasks assigned
   to that rank.
+- `fsdp_overlap="full"` currently requires `fsdp_fused_comm=True`.
 - Cross-world-size distributed checkpoint remapping is still future work.

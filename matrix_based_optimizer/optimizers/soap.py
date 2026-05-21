@@ -66,6 +66,7 @@ class SOAP(BaseOptim):
         fsdp_fused_comm=True,
         fsdp_max_numel_per_slot=None,
         fsdp_balance_cost="numel",
+        fsdp_overlap="none",
     ):
         defaults = {
             "lr": lr,
@@ -92,6 +93,7 @@ class SOAP(BaseOptim):
             fsdp_fused_comm=fsdp_fused_comm,
             fsdp_max_numel_per_slot=fsdp_max_numel_per_slot,
             fsdp_balance_cost=fsdp_balance_cost,
+            fsdp_overlap=fsdp_overlap,
         )
         self._data_format = data_format
         assert precondition_1d is False, 'only support dim=2 for now.'

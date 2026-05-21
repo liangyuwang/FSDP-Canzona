@@ -99,6 +99,7 @@ optimizer = Muon(
             "fsdp_balance": "global",     # "no", "single", "slot", "global"
             "fsdp_fused_comm": True,      # use all_to_all_single
             "fsdp_balance_cost": "flops", # or "numel"
+            "fsdp_overlap": "full",       # "none" keeps the serial path
         }
     ],
     lr=1e-3,
@@ -122,6 +123,7 @@ torchrun --standalone --nproc-per-node=2 \
   --optimizer muon \
   --device cuda \
   --backend nccl \
+  --overlap full \
   --steps 4
 ```
 

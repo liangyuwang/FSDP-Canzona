@@ -16,6 +16,7 @@ run_case() {
   local balance="$3"
   local balance_cost="$4"
   local fused_comm="$5"
+  local overlap="$6"
 
   echo
   echo "========== ${name} =========="
@@ -29,10 +30,12 @@ run_case() {
   BALANCE="${balance}" \
   BALANCE_COST="${balance_cost}" \
   FUSED_COMM="${fused_comm}" \
+  OVERLAP="${overlap}" \
   bash "${SCRIPT_DIR}/example.sh"
 }
 
-run_case "muon-simple-unfused" "muon" "no" "numel" "0"
-run_case "muon-global-fused" "muon" "global" "flops" "1"
-run_case "soap-global-unfused" "soap" "global" "numel" "0"
-
+run_case "muon-simple-serial" "muon" "no" "numel" "1" "none"
+run_case "muon-global-serial" "muon" "global" "flops" "1" "none"
+run_case "muon-global-full-overlap" "muon" "global" "flops" "1" "full"
+run_case "soap-global-serial" "soap" "global" "numel" "1" "none"
+run_case "soap-global-full-overlap" "soap" "global" "numel" "1" "full"

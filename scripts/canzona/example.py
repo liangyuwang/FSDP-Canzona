@@ -88,6 +88,7 @@ def parse_args():
     parser.add_argument("--backend", choices=["auto", "nccl", "gloo"], default="auto")
     parser.add_argument("--balance", choices=["no", "single", "slot", "global"], default="global")
     parser.add_argument("--balance-cost", choices=["numel", "flops"], default="numel")
+    parser.add_argument("--overlap", choices=["none", "full"], default="none")
     parser.add_argument("--no-fused-comm", action="store_true", help="Use all_gather/scatter instead of all_to_all_single.")
     parser.add_argument("--atol", type=float, default=2e-3)
     parser.add_argument("--rtol", type=float, default=2e-3)
@@ -224,6 +225,7 @@ def build_fsdp_canzona_optimizer(args, named_params, rank, world_size, group):
         "fsdp_balance": args.balance,
         "fsdp_balance_cost": args.balance_cost,
         "fsdp_fused_comm": not args.no_fused_comm,
+        "fsdp_overlap": args.overlap,
     }
     return local_params, make_optimizer(args, [param_group])
 
@@ -296,7 +298,8 @@ def main():
         print(
             f"tiny_lm layers={args.num_layers} hidden={args.hidden_size} "
             f"heads={args.num_heads} ffn={args.ffn_hidden_size} "
-            f"selected_matrices={len(named_params)} optimizer={args.optimizer}"
+            f"selected_matrices={len(named_params)} optimizer={args.optimizer} "
+            f"overlap={args.overlap}"
         )
 
     passed = True
@@ -328,4 +331,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

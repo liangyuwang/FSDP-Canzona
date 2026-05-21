@@ -36,6 +36,7 @@ torchrun --standalone --nproc-per-node=2 \
   --steps 4 \
   --balance global \
   --balance-cost flops \
+  --overlap full \
   --num-layers 2 \
   --hidden-size 32 \
   --num-heads 4 \
@@ -65,7 +66,7 @@ Run one configured example:
 
 ```bash
 OPTIMIZER=muon NPROC_PER_NODE=2 DEVICE=cuda BACKEND=nccl \
-  BALANCE=global BALANCE_COST=flops FUSED_COMM=1 \
+  BALANCE=global BALANCE_COST=flops OVERLAP=full FUSED_COMM=1 \
   NUM_LAYERS=2 HIDDEN_SIZE=32 NUM_HEADS=4 FFN_HIDDEN_SIZE=64 \
   bash scripts/canzona/example.sh
 ```
@@ -100,7 +101,7 @@ torchrun --standalone --nproc-per-node=2 \
 The script prints per-step maximum absolute and relative differences:
 
 ```text
-tiny_lm layers=2 hidden=32 heads=4 ffn=64 selected_matrices=8 optimizer=muon
+tiny_lm layers=2 hidden=32 heads=4 ffn=64 selected_matrices=8 optimizer=muon overlap=full
 step=01 loss=4.941732 max_abs=0.000000e+00 max_rel=0.000000e+00 worst=blocks.layers.0.self_attn.in_proj_weight status=PASS
 step=02 loss=4.889214 max_abs=0.000000e+00 max_rel=0.000000e+00 worst=blocks.layers.0.self_attn.in_proj_weight status=PASS
 alignment=PASS
@@ -109,3 +110,7 @@ alignment=PASS
 Small non-zero differences can appear when using BF16/CUDA kernels. Tune
 `--atol` and `--rtol` if your hardware or PyTorch version produces slightly
 different low-level math.
+
+`OVERLAP=none` keeps the serial gather -> compute -> scatter -> update path.
+`OVERLAP=full` enables the pipelined path and currently requires fused
+communication (`FUSED_COMM=1`).
