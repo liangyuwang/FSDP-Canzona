@@ -1,8 +1,11 @@
 # FSDP-Canzona
 
-FSDP-Canzona is an FSDP-oriented implementation of
-[Canzona](https://arxiv.org/html/2602.06079), adapted from the Megatron-based
-[Megatron-Canzona](https://github.com/liangyuwang/Megatron-Canzona) prototype.
+FSDP-Canzona is an FSDP-oriented implementation of Canzona for distributed
+matrix-based optimizers.
+
+- **Paper:** [Canzona: A Unified, Asynchronous, and Load-Balanced Framework for Distributed Matrix-based Optimizers](https://arxiv.org/html/2602.06079)
+- **Megatron implementation:** [liangyuwang/Megatron-Canzona](https://github.com/liangyuwang/Megatron-Canzona)
+- **This repository:** an FSDP adaptation of the same optimizer-step idea.
 
 Canzona makes matrix-based optimizers such as Muon and SOAP practical under
 distributed sharding. These optimizers need full 2D matrices for operations like
@@ -15,7 +18,7 @@ then applying the local shard update.
 ![FSDP-Canzona optimizer-step overview](image/overview.png)
 
 The design mirrors the Megatron-Canzona TP path: both TP and FSDP split each
-parameter uniformly across ranks, so the same gather → compute → scatter →
+parameter uniformly across ranks, so the same gather -> compute -> scatter ->
 update schedule can be reused with FSDP process groups and shard metadata.
 
 ## Key Ideas
@@ -105,9 +108,49 @@ optimizer = Muon(
 For non-sharded local parameters, the optimizers behave like regular
 `torch.optim.Optimizer` subclasses.
 
+## Example Scripts
+
+See [`scripts/canzona/README.md`](scripts/canzona/README.md) for runnable toy
+alignment checks on a tiny causal Transformer LM built from PyTorch modules.
+The main script compares FSDP-Canzona shard updates against a replicated
+full-matrix baseline, which is equivalent to single-rank training or DDP after
+gradient all-reduce:
+
+```bash
+torchrun --standalone --nproc-per-node=2 \
+  scripts/canzona/example.py \
+  --optimizer muon \
+  --device cuda \
+  --backend nccl \
+  --steps 4
+```
+
+For batch alignment runs:
+
+```bash
+NPROC_PER_NODE=2 DEVICE=cuda BACKEND=nccl bash scripts/canzona/align.sh
+```
+
 ## Current Status
 
 - FSDP-oriented executor and Muon/SOAP integration are implemented.
 - Megatron TP-specific dependencies have been removed from the main path.
 - Cross-world-size optimizer-state checkpoint remapping is not implemented yet.
 - CUDA graph capture is disabled for the FSDP communication path.
+
+## Citation
+
+If you use this project, please cite the Canzona paper:
+
+```bibtex
+@misc{wang2026canzona,
+  title        = {Canzona: A Unified, Asynchronous, and Load-Balanced Framework for Distributed Matrix-based Optimizers},
+  author       = {Wang, Liangyu and Zhang, Siqi and Wang, Junjie and Dong, Yiming and Zheng, Bo and Qiu, Zihan and Tang, Shengkun and Wang, Di and Men, Rui and Liu, Dayiheng},
+  year         = {2026},
+  eprint       = {2602.06079},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.DC},
+  doi          = {10.48550/arXiv.2602.06079},
+  url          = {https://arxiv.org/abs/2602.06079}
+}
+```
