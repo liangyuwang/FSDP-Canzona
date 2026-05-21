@@ -100,6 +100,7 @@ optimizer = Muon(
             "fsdp_fused_comm": True,      # use all_to_all_single
             "fsdp_balance_cost": "flops", # or "numel"
             "fsdp_overlap": "full",       # "none" keeps the serial path
+            "fsdp_log_visualization": True, # optional one-time load report
         }
     ],
     lr=1e-3,

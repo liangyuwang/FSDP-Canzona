@@ -41,6 +41,9 @@ Set these fields for sharded matrix params:
 - `fsdp_overlap`: `none` for the serial path, or `full` for the pipelined path
   that overlaps gather for the next micro-group, compute for the current
   micro-group, and scatter/update for the previous micro-group.
+- `fsdp_log_visualization`: optional `True` to print a one-time load-balance
+  report for the no-balance schedule and the selected FSDP-Canzona schedule.
+  The same behavior can be enabled with `FSDP_CANZONA_LOG_VISUALIZATION=1`.
 
 Parameter attributes with the same meaning are also supported:
 `fsdp_full_shape`, `fsdp_local_shape`, and `fsdp_shard_dim`.

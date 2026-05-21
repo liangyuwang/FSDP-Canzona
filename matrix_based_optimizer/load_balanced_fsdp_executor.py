@@ -236,6 +236,7 @@ class FSDPShardExecutor:
             param_group["params"],
             specs,
         )
+        self._maybe_log_visualization(param_group, specs, micro_param_groups)
         if self.overlap == "full":
             return self.execute_full_overlap(
                 micro_param_groups,
@@ -259,6 +260,32 @@ class FSDPShardExecutor:
             )
             shard_updates_group = self.scatter(micro_param_group, full_updates_group)
             self.update(micro_param_group, shard_updates_group, param_update_fn, *args, group=param_group, **kwargs)
+
+    def _maybe_log_visualization(self, param_group, specs, micro_param_groups):
+        enabled = param_group.get("fsdp_log_visualization")
+        if enabled is None:
+            enabled = int(os.environ.get("FSDP_CANZONA_LOG_VISUALIZATION", 0)) == 1
+        if not enabled or param_group.get("_fsdp_visualization_logged", False):
+            return
+
+        from .visualize import FSDPLoadVisualizer
+
+        visualizer = FSDPLoadVisualizer(
+            self.world_size,
+            rank=self.group_rank,
+            rank_to_log=0,
+            optimizer=self.optimizer,
+            soap_precondition_frequency=self.soap_precondition_frequency,
+            soap_max_precond_dim=self.soap_max_precond_dim,
+            log_fn=print,
+        )
+        no_balance_groups = self.get_micro_param_groups("no", param_group["params"], specs)
+        visualizer.visualize(no_balance_groups, title="FSDP No Load Balance Report")
+        visualizer.visualize(
+            micro_param_groups,
+            title=f"FSDP Load Balance Report, balance={self.balance}",
+        )
+        param_group["_fsdp_visualization_logged"] = True
 
     def execute_full_overlap(self, micro_param_groups, param_group, param_step_fn, param_update_fn, *args, **kwargs):
         if not self.fused_comm:
