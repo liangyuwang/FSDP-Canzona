@@ -25,21 +25,36 @@ class MicroGroupContext:
     idx: int
     micro_param_group: object
     gather_work: object = None
-    gather_send_buffer: object = None
-    gather_recv_buffer: object = None
-    gather_recv_split_sizes: object = None
-    gather_local_numels: object = None
+    gather_state: object = None
     full_tensors_group: object = None
     full_updates_group: object = None
     scatter_work: object = None
     scatter_flag_work: object = None
-    scatter_send_buffer: object = None
-    scatter_recv_buffer: object = None
-    scatter_recv_split_sizes: object = None
-    scatter_flag_send_buffer: object = None
-    scatter_flag_recv_buffer: object = None
-    scatter_flag_recv_split_sizes: object = None
+    scatter_state: object = None
     shard_updates_group: object = None
+
+
+@dataclass
+class FusedGatherState:
+    full_tensors_group: object
+    send_buffer: object = None
+    send_split_sizes: object = None
+    recv_buffer: object = None
+    recv_split_sizes: object = None
+    local_numels: object = None
+
+
+@dataclass
+class FusedScatterState:
+    shard_updates_group: object
+    send_buffer: object = None
+    send_split_sizes: object = None
+    recv_buffer: object = None
+    recv_split_sizes: object = None
+    flag_send_buffer: object = None
+    flag_send_split_sizes: object = None
+    flag_recv_buffer: object = None
+    flag_recv_split_sizes: object = None
 
 
 def get_numel_from_shape(shape: Sequence[int]) -> int:
@@ -282,157 +297,30 @@ class FSDPShardExecutor:
         self.update(last.micro_param_group, last.shard_updates_group, param_update_fn, *args, group=param_group, **kwargs)
 
     def launch_gather(self, ctx: MicroGroupContext):
-        micro_param_group = ctx.micro_param_group
-        ctx.full_tensors_group = [[] for _ in range(self.world_size)]
-        ref = self._first_grad_or_param(micro_param_group)
-        if ref is None:
-            return
-
-        send_tensors = []
-        send_split_sizes = []
-        for _, slot in micro_param_group:
-            grads_for_host = [
-                p.grad.contiguous().view(spec.local_shape).reshape(-1)
-                for p, spec in slot
-                if p.grad is not None
-            ]
-            if grads_for_host:
-                tensor = torch.cat(grads_for_host).contiguous()
-            else:
-                tensor = torch.empty(0, dtype=ref.dtype, device=ref.device)
-            send_tensors.append(tensor)
-            send_split_sizes.append(tensor.numel())
-
-        ctx.gather_send_buffer = torch.cat(send_tensors).contiguous() if send_tensors else torch.empty(0, dtype=ref.dtype, device=ref.device)
-        _, my_slot = micro_param_group[self.group_rank]
-        ctx.gather_local_numels = [get_numel_from_shape(spec.local_shape) for _, spec in my_slot]
-        recv_per_rank = sum(ctx.gather_local_numels)
-        ctx.gather_recv_split_sizes = [recv_per_rank] * self.world_size
-        ctx.gather_recv_buffer = torch.empty(
-            sum(ctx.gather_recv_split_sizes),
-            dtype=ctx.gather_send_buffer.dtype,
-            device=ctx.gather_send_buffer.device,
-        )
-        ctx.gather_work = dist.all_to_all_single(
-            ctx.gather_recv_buffer,
-            ctx.gather_send_buffer,
-            output_split_sizes=ctx.gather_recv_split_sizes,
-            input_split_sizes=send_split_sizes,
-            group=self.group,
-            async_op=True,
-        )
+        ctx.gather_state = self._pack_gather_fused(ctx.micro_param_group)
+        ctx.full_tensors_group = ctx.gather_state.full_tensors_group
+        ctx.gather_work = self._launch_gather_fused(ctx.gather_state, async_op=True)
 
     def finish_gather(self, ctx: MicroGroupContext):
-        if ctx.gather_work is None:
-            return ctx.full_tensors_group
-        ctx.gather_work.wait()
-        my_slot = ctx.micro_param_group[self.group_rank][1]
-        recv_streams = torch.split(ctx.gather_recv_buffer, ctx.gather_recv_split_sizes)
-        stream_offset = 0
-        for (p, spec), shard_numel in zip(my_slot, ctx.gather_local_numels):
-            shards = []
-            for src_rank in range(self.world_size):
-                shard = recv_streams[src_rank][stream_offset : stream_offset + shard_numel]
-                shards.append(shard.contiguous().view(spec.local_shape))
-            ctx.full_tensors_group[self.group_rank].append(torch.cat(shards, dim=spec.shard_dim).view(spec.full_shape))
-            stream_offset += shard_numel
+        if ctx.gather_work is not None:
+            ctx.gather_work.wait()
+        ctx.full_tensors_group = self._unpack_gather_fused(ctx.micro_param_group, ctx.gather_state)
         return ctx.full_tensors_group
 
     def launch_scatter(self, ctx: MicroGroupContext):
-        micro_param_group = ctx.micro_param_group
-        full_updates_group = ctx.full_updates_group
-        ctx.shard_updates_group = [[] for _ in range(self.world_size)]
-        ref = self._first_grad_or_param(micro_param_group)
-        if ref is None:
-            return
-
-        send_streams = [[] for _ in range(self.world_size)]
-        send_flag_streams = [[] for _ in range(self.world_size)]
-        for host_group_rank, slot in micro_param_group:
-            if host_group_rank != self.group_rank:
-                continue
-            for (p, spec), full_update in zip(slot, full_updates_group[host_group_rank]):
-                skip_update = full_update is None
-                if full_update is None:
-                    full_update = torch.zeros(spec.full_shape, dtype=ref.dtype, device=ref.device)
-                shards = torch.chunk(full_update.contiguous().view(spec.full_shape), self.world_size, dim=spec.shard_dim)
-                for target_rank, shard in enumerate(shards):
-                    send_streams[target_rank].append(shard.contiguous().view(-1))
-                    send_flag_streams[target_rank].append(
-                        torch.tensor([1 if skip_update else 0], dtype=torch.uint8, device=ref.device)
-                    )
-
-        flat_send_tensors = []
-        send_split_sizes = []
-        for stream in send_streams:
-            if stream:
-                tensor = torch.cat(stream).contiguous()
-            else:
-                tensor = torch.empty(0, dtype=ref.dtype, device=ref.device)
-            flat_send_tensors.append(tensor)
-            send_split_sizes.append(tensor.numel())
-
-        ctx.scatter_send_buffer = torch.cat(flat_send_tensors).contiguous() if flat_send_tensors else torch.empty(0, dtype=ref.dtype, device=ref.device)
-        ctx.scatter_recv_split_sizes = [
-            sum(get_numel_from_shape(spec.local_shape) for _, spec in slot)
-            for _, slot in micro_param_group
-        ]
-        ctx.scatter_recv_buffer = torch.empty(
-            sum(ctx.scatter_recv_split_sizes),
-            dtype=ctx.scatter_send_buffer.dtype,
-            device=ctx.scatter_send_buffer.device,
-        )
-        ctx.scatter_work = dist.all_to_all_single(
-            ctx.scatter_recv_buffer,
-            ctx.scatter_send_buffer,
-            output_split_sizes=ctx.scatter_recv_split_sizes,
-            input_split_sizes=send_split_sizes,
-            group=self.group,
-            async_op=True,
-        )
-
-        flat_send_flags = []
-        flag_send_split_sizes = []
-        for stream in send_flag_streams:
-            if stream:
-                tensor = torch.cat(stream).contiguous()
-            else:
-                tensor = torch.empty(0, dtype=torch.uint8, device=ref.device)
-            flat_send_flags.append(tensor)
-            flag_send_split_sizes.append(tensor.numel())
-        ctx.scatter_flag_send_buffer = torch.cat(flat_send_flags).contiguous() if flat_send_flags else torch.empty(0, dtype=torch.uint8, device=ref.device)
-        ctx.scatter_flag_recv_split_sizes = [len(slot) for _, slot in micro_param_group]
-        ctx.scatter_flag_recv_buffer = torch.empty(sum(ctx.scatter_flag_recv_split_sizes), dtype=torch.uint8, device=ref.device)
-        ctx.scatter_flag_work = dist.all_to_all_single(
-            ctx.scatter_flag_recv_buffer,
-            ctx.scatter_flag_send_buffer,
-            output_split_sizes=ctx.scatter_flag_recv_split_sizes,
-            input_split_sizes=flag_send_split_sizes,
-            group=self.group,
+        ctx.scatter_state = self._pack_scatter_fused(ctx.micro_param_group, ctx.full_updates_group)
+        ctx.shard_updates_group = ctx.scatter_state.shard_updates_group
+        ctx.scatter_work, ctx.scatter_flag_work = self._launch_scatter_fused(
+            ctx.scatter_state,
             async_op=True,
         )
 
     def finish_scatter(self, ctx: MicroGroupContext):
-        if ctx.scatter_work is None:
-            return ctx.shard_updates_group
-        ctx.scatter_work.wait()
-        ctx.scatter_flag_work.wait()
-        recv_streams = torch.split(ctx.scatter_recv_buffer, ctx.scatter_recv_split_sizes)
-        flag_recv_streams = torch.split(ctx.scatter_flag_recv_buffer, ctx.scatter_flag_recv_split_sizes)
-        for src_group_rank, (_, slot) in enumerate(ctx.micro_param_group):
-            src_stream = recv_streams[src_group_rank]
-            flag_stream = flag_recv_streams[src_group_rank]
-            offset = 0
-            for flag_idx, (_, spec) in enumerate(slot):
-                shard_numel = get_numel_from_shape(spec.local_shape)
-                skip_update = bool(flag_stream[flag_idx].item())
-                if skip_update:
-                    ctx.shard_updates_group[src_group_rank].append(None)
-                else:
-                    ctx.shard_updates_group[src_group_rank].append(
-                        src_stream[offset : offset + shard_numel].contiguous().view(spec.local_shape)
-                    )
-                offset += shard_numel
+        if ctx.scatter_work is not None:
+            ctx.scatter_work.wait()
+        if ctx.scatter_flag_work is not None:
+            ctx.scatter_flag_work.wait()
+        ctx.shard_updates_group = self._unpack_scatter_fused(ctx.micro_param_group, ctx.scatter_state)
         return ctx.shard_updates_group
 
     def gather(self, micro_param_group):
@@ -441,10 +329,15 @@ class FSDPShardExecutor:
         return self._gather_unfused(micro_param_group)
 
     def _gather_fused(self, micro_param_group):
+        state = self._pack_gather_fused(micro_param_group)
+        self._launch_gather_fused(state, async_op=False)
+        return self._unpack_gather_fused(micro_param_group, state)
+
+    def _pack_gather_fused(self, micro_param_group):
         full_tensors_group = [[] for _ in range(self.world_size)]
         ref = self._first_grad_or_param(micro_param_group)
         if ref is None:
-            return full_tensors_group
+            return FusedGatherState(full_tensors_group=full_tensors_group)
 
         send_tensors = []
         send_split_sizes = []
@@ -467,26 +360,41 @@ class FSDPShardExecutor:
         recv_per_rank = sum(local_numels)
         recv_split_sizes = [recv_per_rank] * self.world_size
         recv_buffer = torch.empty(sum(recv_split_sizes), dtype=send_buffer.dtype, device=send_buffer.device)
-
-        dist.all_to_all_single(
-            recv_buffer,
-            send_buffer,
-            output_split_sizes=recv_split_sizes,
-            input_split_sizes=send_split_sizes,
-            group=self.group,
+        return FusedGatherState(
+            full_tensors_group=full_tensors_group,
+            send_buffer=send_buffer,
+            send_split_sizes=send_split_sizes,
+            recv_buffer=recv_buffer,
+            recv_split_sizes=recv_split_sizes,
+            local_numels=local_numels,
         )
 
-        recv_streams = torch.split(recv_buffer, recv_split_sizes)
+    def _launch_gather_fused(self, state: FusedGatherState, async_op: bool):
+        if state.send_buffer is None:
+            return None
+        return dist.all_to_all_single(
+            state.recv_buffer,
+            state.send_buffer,
+            output_split_sizes=state.recv_split_sizes,
+            input_split_sizes=state.send_split_sizes,
+            group=self.group,
+            async_op=async_op,
+        )
+
+    def _unpack_gather_fused(self, micro_param_group, state: FusedGatherState):
+        if state.recv_buffer is None:
+            return state.full_tensors_group
+        _, my_slot = micro_param_group[self.group_rank]
+        recv_streams = torch.split(state.recv_buffer, state.recv_split_sizes)
         stream_offset = 0
-        for p, spec in my_slot:
-            shard_numel = get_numel_from_shape(spec.local_shape)
+        for (_, spec), shard_numel in zip(my_slot, state.local_numels):
             shards = []
             for src_rank in range(self.world_size):
                 shard = recv_streams[src_rank][stream_offset : stream_offset + shard_numel]
                 shards.append(shard.contiguous().view(spec.local_shape))
-            full_tensors_group[self.group_rank].append(torch.cat(shards, dim=spec.shard_dim).view(spec.full_shape))
+            state.full_tensors_group[self.group_rank].append(torch.cat(shards, dim=spec.shard_dim).view(spec.full_shape))
             stream_offset += shard_numel
-        return full_tensors_group
+        return state.full_tensors_group
 
     def _gather_unfused(self, micro_param_group):
         full_tensors_group = [[] for _ in range(self.world_size)]
@@ -523,10 +431,15 @@ class FSDPShardExecutor:
         return self._scatter_unfused(micro_param_group, full_updates_group)
 
     def _scatter_fused(self, micro_param_group, full_updates_group):
+        state = self._pack_scatter_fused(micro_param_group, full_updates_group)
+        self._launch_scatter_fused(state, async_op=False)
+        return self._unpack_scatter_fused(micro_param_group, state)
+
+    def _pack_scatter_fused(self, micro_param_group, full_updates_group):
         shard_updates_group = [[] for _ in range(self.world_size)]
         ref = self._first_grad_or_param(micro_param_group)
         if ref is None:
-            return shard_updates_group
+            return FusedScatterState(shard_updates_group=shard_updates_group)
 
         send_streams = [[] for _ in range(self.world_size)]
         send_flag_streams = [[] for _ in range(self.world_size)]
@@ -560,13 +473,6 @@ class FSDPShardExecutor:
             for _, slot in micro_param_group
         ]
         recv_buffer = torch.empty(sum(recv_split_sizes), dtype=send_buffer.dtype, device=send_buffer.device)
-        dist.all_to_all_single(
-            recv_buffer,
-            send_buffer,
-            output_split_sizes=recv_split_sizes,
-            input_split_sizes=send_split_sizes,
-            group=self.group,
-        )
 
         flat_send_flags = []
         flag_send_split_sizes = []
@@ -580,16 +486,44 @@ class FSDPShardExecutor:
         flag_send_buffer = torch.cat(flat_send_flags).contiguous() if flat_send_flags else torch.empty(0, dtype=torch.uint8, device=ref.device)
         flag_recv_split_sizes = [len(slot) for _, slot in micro_param_group]
         flag_recv_buffer = torch.empty(sum(flag_recv_split_sizes), dtype=torch.uint8, device=ref.device)
-        dist.all_to_all_single(
-            flag_recv_buffer,
-            flag_send_buffer,
-            output_split_sizes=flag_recv_split_sizes,
-            input_split_sizes=flag_send_split_sizes,
-            group=self.group,
+        return FusedScatterState(
+            shard_updates_group=shard_updates_group,
+            send_buffer=send_buffer,
+            send_split_sizes=send_split_sizes,
+            recv_buffer=recv_buffer,
+            recv_split_sizes=recv_split_sizes,
+            flag_send_buffer=flag_send_buffer,
+            flag_send_split_sizes=flag_send_split_sizes,
+            flag_recv_buffer=flag_recv_buffer,
+            flag_recv_split_sizes=flag_recv_split_sizes,
         )
 
-        recv_streams = torch.split(recv_buffer, recv_split_sizes)
-        flag_recv_streams = torch.split(flag_recv_buffer, flag_recv_split_sizes)
+    def _launch_scatter_fused(self, state: FusedScatterState, async_op: bool):
+        if state.send_buffer is None:
+            return None, None
+        scatter_work = dist.all_to_all_single(
+            state.recv_buffer,
+            state.send_buffer,
+            output_split_sizes=state.recv_split_sizes,
+            input_split_sizes=state.send_split_sizes,
+            group=self.group,
+            async_op=async_op,
+        )
+        flag_work = dist.all_to_all_single(
+            state.flag_recv_buffer,
+            state.flag_send_buffer,
+            output_split_sizes=state.flag_recv_split_sizes,
+            input_split_sizes=state.flag_send_split_sizes,
+            group=self.group,
+            async_op=async_op,
+        )
+        return scatter_work, flag_work
+
+    def _unpack_scatter_fused(self, micro_param_group, state: FusedScatterState):
+        if state.recv_buffer is None:
+            return state.shard_updates_group
+        recv_streams = torch.split(state.recv_buffer, state.recv_split_sizes)
+        flag_recv_streams = torch.split(state.flag_recv_buffer, state.flag_recv_split_sizes)
         for src_group_rank, (_, slot) in enumerate(micro_param_group):
             src_stream = recv_streams[src_group_rank]
             flag_stream = flag_recv_streams[src_group_rank]
@@ -598,13 +532,13 @@ class FSDPShardExecutor:
                 shard_numel = get_numel_from_shape(spec.local_shape)
                 skip_update = bool(flag_stream[flag_idx].item())
                 if skip_update:
-                    shard_updates_group[src_group_rank].append(None)
+                    state.shard_updates_group[src_group_rank].append(None)
                 else:
-                    shard_updates_group[src_group_rank].append(
+                    state.shard_updates_group[src_group_rank].append(
                         src_stream[offset : offset + shard_numel].contiguous().view(spec.local_shape)
                     )
                 offset += shard_numel
-        return shard_updates_group
+        return state.shard_updates_group
 
     def _scatter_unfused(self, micro_param_group, full_updates_group):
         shard_updates_group = [[] for _ in range(self.world_size)]
